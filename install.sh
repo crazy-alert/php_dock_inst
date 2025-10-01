@@ -309,7 +309,12 @@ fi
 
 cat >> php/Dockerfile <<EOF
 
-RUN usermod -u $USER_ID www-data && groupmod -g $GROUP_ID www-data
+# Для Alpine:
+RUN apk add --no-cache shadow
+RUN usermod -u 0 www-data && groupmod -g 0 www-data
+# Для Ubuntu/Debian:
+# RUN apt-get update && apt-get install -y passwd
+# RUN usermod -u 0 www-data && groupmod -g 0 www-data
 EOF
 
 if [[ "$INSTALL_XDEBUG" == "y" || "$INSTALL_XDEBUG" == "Y" ]]; then
