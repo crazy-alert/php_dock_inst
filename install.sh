@@ -17,6 +17,7 @@ echo "Создаю структуру проекта в папке: $ABS_PROJECT
 mkdir -p "$PROJECT_DIR"
 cd "$PROJECT_DIR"
 mkdir -p nginx php mysql wwwroot
+chmod 777 wwwroot
 USER_ID=$(id -u)
 GROUP_ID=$(id -g)
 
@@ -98,6 +99,7 @@ if [ -n "$GIT_REPO" ]; then
     echo "Settings > SSH and GPG keys > New SSH key."
     echo "Вставьте ключ: $PUBLIC_KEY"
     echo "После добавления ключа нажмите Enter для продолжения клонирования репозитория..."
+    echo "(если репозиторий публичный - смело жмякай интер)"
     read
 
 
@@ -144,6 +146,7 @@ if [ -n "$GIT_REPO" ]; then
     rm -rf wwwroot/*
     mv temp_repo/* wwwroot/ 2>/dev/null || true
     rm -rf temp_repo
+    
 
     echo "Готово! Ветка $branch клонирована в wwwroot."
 
@@ -220,15 +223,15 @@ while true; do
     fi
 done
 
-# Проверка, является ли ADDRESS локальным доменом (*.local)
-IS_LOCAL=false
-if [[ "$ADDRESS" == *.local ]]; then
-    IS_LOCAL=true
-elif [[ "$ADDRESS" =~ ^[0-9.]+$ ]]; then
-    IS_LOCAL=true
+
+echo ""
+echo "Для адреса $ADDRESS добавляем добавить SSL-сервер? (y/n, по умолчанию n - просто нажмите Enter):"
+read INSTALL_SSL
+if [[ "$INSTALL_SSL" == "y" || "$INSTALL_SSL" == "Y" ]]; then
+    INSTALL_SSL="y"
+else
+    INSTALL_SSL="n"
 fi
-
-
 
 # Создание nginx.conf
 cat > nginx/nginx.conf <<EOF
@@ -258,9 +261,11 @@ server {
 }
 EOF
 
+
+
 # Если не локальный домен, добавить SSL-сервер
-if [ "$IS_LOCAL" = false ]; then
-    echo "Домен выбран не локальный, добавляем SSL-сервер.."
+if [ "$INSTALL_SSL" = y ]; then
+    echo "               добавляем SSL-сервер.."
     cat >> nginx/nginx.conf <<EOF
 
 server {
@@ -338,7 +343,7 @@ services:
       - "$ADDRESS:$PORT:80"
 EOF
 
-if [ "$IS_LOCAL" = false ]; then
+if [ "$INSTALL_SSL" = y  ]; then
     cat >> docker-compose.yml <<EOF
       - "$ADDRESS:443:443"
 EOF
@@ -350,7 +355,7 @@ cat >> docker-compose.yml <<EOF
       - ./wwwroot:/var/www/html
 EOF
 
-if [ "$IS_LOCAL" = false ]; then
+if [ "$INSTALL_SSL" = y ]; then
     cat >> docker-compose.yml <<EOF
       - /etc/letsencrypt:/etc/letsencrypt
 EOF
@@ -416,7 +421,7 @@ chown -R $USER_ID:$GROUP_ID wwwroot
 
 
 # Если не локальный домен, установить Certbot и выпустить сертификат
-if [ "$IS_LOCAL" = false ]; then
+if [ "$INSTALL_SSL" = y  ]; then
     echo "Устанавливаю Certbot для Let's Encrypt..."
     sudo apt-get update && sudo apt-get install -y certbot
 
@@ -466,7 +471,7 @@ if [ -n "$GIT_REPO" ]; then
     echo "SSH-ключ сохранён в: $ABS_PROJECT_DIR/github-public.key"
 fi
 echo "Адрес сайта: $ADDRESS:$PORT"
-if [ "$IS_LOCAL" = false ]; then
+if [ "$INSTALL_SSL" = y ]; then
     echo "HTTPS настроен с сертификатом Let's Encrypt для $ADDRESS"
     echo "Автообновление сертификата: каждый день в 12:00"
 fi
