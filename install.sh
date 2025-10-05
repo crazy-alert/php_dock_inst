@@ -17,8 +17,246 @@ print_success() { echo -e "${GREEN}✅ $1${NC}"; }
 print_warning() { echo -e "${YELLOW}⚠️  $1${NC}"; }
 print_error() { echo -e "${RED}❌ $1${NC}"; }
 
+# Функция проверки и установки Docker
+check_and_install_docker() {
+    # Проверяем, установлен ли Docker
+    if ! command -v docker &> /dev/null; then
+        print_error "Docker не установлен"
+        print_info "Начинаю установку Docker..."
+        
+        # Установка Docker
+        curl -fsSL https://get.docker.com -o get-docker.sh
+        sudo sh get-docker.sh
+        
+        # Даем время на установку
+        sleep 5
+    else
+        print_success "Docker уже установлен"
+    fi
+    
+    # Проверяем, установлен ли Docker Compose
+    if ! command -v docker-compose &> /dev/null && ! command -v docker compose &> /dev/null; then
+        print_warning "Docker Compose не установлен"
+        print_info "Устанавливаем Docker Compose..."
+        
+        # Установка Docker Compose
+        sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+        sudo chmod +x /usr/local/bin/docker-compose
+        
+        # Создаем симлинк для старой версии
+        if [ ! -f "/usr/bin/docker-compose" ]; then
+            sudo ln -s /usr/local/bin/docker-compose /usr/bin/docker-compose
+        fi
+    else
+        print_success "Docker Compose уже установлен"
+    fi
+    
+    # Улучшенная проверка Docker демона
+    check_docker_daemon() {
+        # Пробуем разные способы проверки
+        if timeout 5 docker info > /dev/null 2>&1; then
+            return 0
+        fi
+        
+        # Пробуем запустить через systemd
+        if sudo systemctl is-active --quiet docker 2>/dev/null; then
+            return 0
+        fi
+        
+        # Пробуем запустить напрямую
+        if pgrep -f dockerd > /dev/null; then
+            return 0
+        fi
+        
+        return 1
+    }
+    
+    # Проверяем Docker демон
+    if ! check_docker_daemon; then
+        print_warning "Docker демон не запущен"
+        print_info "Пытаемся запустить Docker демон..."
+        
+        # Пробуем разные способы запуска
+        
+        # Способ 1: systemd (если доступен)
+        if command -v systemctl &> /dev/null && [ -f "/lib/systemd/system/docker.service" ]; then
+            sudo systemctl start docker
+            sudo systemctl enable docker
+            sleep 3
+        fi
+        
+        # Способ 2: Прямой запуск dockerd
+        if ! check_docker_daemon; then
+            print_info "Запускаем Docker демон напрямую..."
+            sudo nohup dockerd > /var/log/dockerd.log 2>&1 &
+            sleep 5
+        fi
+        
+        # Способ 3: Проверяем через socket
+        if ! check_docker_daemon; then
+            print_info "Проверяем Docker socket..."
+            if [ -S "/var/run/docker.sock" ]; then
+                sudo chmod 666 /var/run/docker.sock
+            fi
+        fi
+        
+        # Финальная проверка
+        if ! check_docker_daemon; then
+            print_error "Не удалось запустить Docker демон"
+            print_info "Попробуйте выполнить вручную: sudo dockerd &"
+            print_info "Или переустановите Docker: curl -fsSL https://get.docker.com | sh"
+            exit 1
+        fi
+    fi
+    
+    # Проверяем, что можем выполнять docker команды
+    if ! docker ps > /dev/null 2>&1; then
+        print_error "Нет доступа к Docker демону"
+        print_info "Добавляем пользователя в группу docker..."
+        sudo usermod -aG docker $USER
+        print_warning "Требуется перезапуск сессии"
+        print_info "Выполните: newgrp docker"
+        print_info "Или перезапустите терминал"
+        exit 1
+    fi
+    
+    print_success "Docker готов к работе"
+}
 
-# Добавить после цветовых функций:
+# Проверяем и устанавливаем Docker в самом начале
+print_info "Проверка Docker..."
+check_and_install_docker
+
+# Функция для загрузки переменных из .env
+load_env() {
+    if [ -f .env ]; then
+        set -a
+        source .env
+        set +a
+        print_success "Переменные из .env загружены"
+    else
+        print_warning "Файл .env не найден, будет создан новый"
+    fi
+}
+
+# Функция для сохранения переменных в .env
+save_env() {
+    local env_file=".env"
+    
+    # Создаем или очищаем файл
+    > "$env_file"
+    
+    # Сохраняем все переданные переменные
+    for var in "$@"; do
+        eval "echo \"$var=\${$var}\"" >> "$env_file"
+    done
+    
+    print_success "Конфигурация сохранена в .env"
+}
+
+# Функция для генерации случайного пароля
+generate_password() {
+    local length=${1:-16}
+    tr -dc 'A-Za-z0-9' < /dev/urandom | head -c "$length"
+}
+
+# Функция проверки доступности порта
+check_port_available() {
+    local port=$1
+    
+    # Проверяем, что порт является числом
+    if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+        return 2
+    fi
+    
+    # Проверяем диапазон порта
+    if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        return 2
+    fi
+    
+    # Пробуем разные методы проверки порта
+    local port_in_use=0
+    
+    # Метод 1: Используем ss (самый быстрый и надежный)
+    if command -v ss &> /dev/null; then
+        if ss -tulpn | grep -q ":${port}[[:space:]]"; then
+            port_in_use=1
+        fi
+    # Метод 2: Используем netstat (альтернатива)
+    elif command -v netstat &> /dev/null; then
+        if netstat -tulpn 2>/dev/null | grep -q ":${port}[[:space:]]"; then
+            port_in_use=1
+        fi
+    # Метод 3: Используем lsof
+    elif command -v lsof &> /dev/null; then
+        if lsof -i :"$port" &> /dev/null; then
+            port_in_use=1
+        fi
+    # Метод 4: Пробуем bind к порту (универсальный, но медленнее)
+    else
+        if timeout 2 bash -c "echo > /dev/tcp/localhost/$port" 2>/dev/null; then
+            port_in_use=1
+        else
+            # Если команда завершилась с ошибкой, порт скорее всего свободен
+            port_in_use=0
+        fi
+    fi
+    
+    return $port_in_use
+}
+
+# Загружаем существующие переменные если есть
+load_env
+
+# Функция для настройки автозапуска
+setup_autostart() {
+    local enable_autostart="$1"
+    
+    if [[ "$enable_autostart" =~ ^[Yy]$ ]]; then
+        print_info "Настройка автозапуска при загрузке системы..."
+        
+        # Создаем systemd сервис
+        sudo tee /etc/systemd/system/docker-compose-app.service > /dev/null << EOF
+[Unit]
+Description=Docker Compose Application Service
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=$(pwd)
+ExecStart=$(which docker-compose) up -d
+ExecStop=$(which docker-compose) down
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+        # Даем права на сервис
+        sudo chmod 644 /etc/systemd/system/docker-compose-app.service
+        
+        # Включаем сервис
+        sudo systemctl daemon-reload
+        sudo systemctl enable docker-compose-app.service
+        
+        print_success "Автозапуск включен. Сервис будет запускаться при загрузке системы."
+        
+        # Сохраняем статус автозапуска
+        echo "AUTOSTART_ENABLED=true" >> .env
+    else
+        # Отключаем автозапуск если был включен
+        if systemctl is-enabled docker-compose-app.service 2>/dev/null | grep -q enabled; then
+            sudo systemctl disable docker-compose-app.service
+            print_success "Автозапуск отключен"
+        fi
+        echo "AUTOSTART_ENABLED=false" >> .env
+        print_info "Автозапуск отключен"
+    fi
+}
+
+# Проверка зависимостей
 check_dependencies() {
     local deps=("docker" "docker-compose" "git" "curl")
     local needs_install=()  # Массив для зависимостей, требующих установки
@@ -108,11 +346,8 @@ check_dependencies() {
     fi
 }
 
-
-
 print_info "Проверка зависимостей..."
 check_dependencies || exit 1
-
 
 # Функция для отправки сообщений в Telegram
 send_telegram() {
@@ -123,6 +358,7 @@ send_telegram() {
         
         # Временный файл для полного ответа
         local response_file=$(mktemp)
+        trap 'rm -f "$response_file"' EXIT
         
         print_info "Отправка сообщения в Telegram..."
         
@@ -152,8 +388,6 @@ send_telegram() {
                 429) print_error "Слишком много запросов - превышен лимит" ;;
             esac
         fi
-        
-        rm -f "$response_file"
     else
         print_warning "⚠️  Telegram не настроен"
     fi
@@ -181,7 +415,7 @@ CURRENT_DIR=$(pwd)
 print_info "Текущая директория: $CURRENT_DIR"
 
 # Создаем директории по одной с проверкой
-for dir in  php mysql wwwdata logs/nginx tdlib; do
+for dir in php tdlib wwwdata logs logs/tdlib mysql; do
     if mkdir -p "$dir"; then
         print_success "Создана директория: $dir"
     else
@@ -190,257 +424,7 @@ for dir in  php mysql wwwdata logs/nginx tdlib; do
     fi
 done
 
-# Функция для настройки автозапуска
-setup_autostart() {
-    local enable_autostart="$1"
-    
-    if [[ "$enable_autostart" =~ ^[Yy]$ ]]; then
-        print_info "Настройка автозапуска при загрузке системы..."
-        
-        # Создаем systemd сервис
-        sudo tee /etc/systemd/system/docker-compose-app.service > /dev/null << EOF
-[Unit]
-Description=Docker Compose Application Service
-Requires=docker.service
-After=docker.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-WorkingDirectory=$(pwd)
-ExecStart=$(which docker-compose) up -d
-ExecStop=$(which docker-compose) down
-TimeoutStartSec=0
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-        # Даем права на сервис
-        sudo chmod 644 /etc/systemd/system/docker-compose-app.service
-        
-        # Включаем сервис
-        sudo systemctl daemon-reload
-        sudo systemctl enable docker-compose-app.service
-        
-        print_success "Автозапуск включен. Сервис будет запускаться при загрузке системы."
-        
-        # Сохраняем статус автозапуска
-        echo "AUTOSTART_ENABLED=true" >> .env
-    else
-        # Отключаем автозапуск если был включен
-        if systemctl is-enabled docker-compose-app.service 2>/dev/null | grep -q enabled; then
-            sudo systemctl disable docker-compose-app.service
-            print_success "Автозапуск отключен"
-        fi
-        echo "AUTOSTART_ENABLED=false" >> .env
-        print_info "Автозапуск отключен"
-    fi
-}
-
-# Функция для настройки SSL с Certbot
-setup_ssl() {
-    local domain="$1"
-    local enable_ssl="$2"
-    
-    if [[ "$enable_ssl" =~ ^[Yy]$ ]]; then
-        print_info "Настройка SSL с Let's Encrypt..."
-        
-        # Устанавливаем certbot если не установлен
-        if ! command -v certbot &> /dev/null; then
-            print_info "Установка Certbot..."
-            sudo apt update
-            sudo apt install -y certbot python3-certbot-nginx
-        fi
-        
-        # Проверяем, что домен указывает на сервер
-        print_warning "Убедитесь, что домен $domain указывает на IP этого сервера"
-        read -p "Нажмите Enter после настройки DNS записей..."
-        
-        # Получаем сертификат
-        print_info "Получение SSL сертификата для $domain..."
-        if sudo certbot --nginx -d "$domain" --non-interactive --agree-tos --email admin@$domain 2>/dev/null; then
-            print_success "SSL сертификат успешно получен и установлен"
-            
-            # Настраиваем автоматическое обновление сертификатов
-            print_info "Настройка автоматического обновления сертификатов..."
-            (sudo crontab -l 2>/dev/null; echo "0 12 * * * /usr/bin/certbot renew --quiet") | sudo crontab -
-            print_success "Автообновление сертификатов настроено"
-            
-            # Создаем конфигурацию nginx с SSL
-            create_nginx_ssl_config "$domain"
-            
-            echo "SSL_ENABLED=true" >> .env
-            echo "SSL_DOMAIN=$domain" >> .env
-        else
-            print_error "Не удалось получить SSL сертификат"
-            print_info "Продолжаем без SSL"
-            create_nginx_config "$domain" "http"
-            echo "SSL_ENABLED=false" >> .env
-        fi
-    else
-        print_info "SSL отключен"
-        create_nginx_config "$domain" "http"
-        echo "SSL_ENABLED=false" >> .env
-    fi
-}
-
-# Функция для создания конфигурации nginx
-create_nginx_config() {
-    local domain="$1"
-    local protocol="$2"
-    
-    print_info "Создание конфигурации Nginx для $domain..."
-    cat > nginx/default.conf << 'EOF'
-server {
-    listen 80;
-    server_name $domain;
-    root /var/www/public;
-    index index.php index.html;
-
-    access_log /var/log/nginx/access.log;
-    error_log /var/log/nginx/error.log;
-
-    location / {
-        try_files $uri $uri/ /index.php?$query_string;
-    }
-
-    location ~ \.php$ {
-        fastcgi_pass php:9000;
-        fastcgi_index index.php;
-        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-        include fastcgi_params;
-        fastcgi_buffering off;
-        fastcgi_read_timeout 300;
-    }
-
-    location ~ /\.ht {
-        deny all;
-    }
-}
-EOF
-
-# Проверяем что файл создан
-if [ ! -f "nginx/default.conf" ]; then
-    print_error "Не удалось создать nginx/default.conf"
-    exit 1
-fi
-
-print_success "Конфигурация Nginx создана"
-#     if [ "$protocol" = "https" ]; then
-#         sudo tee /etc/nginx/sites-available/$domain > /dev/null << EOF
-# server {
-#     listen 80;
-#     server_name $domain;
-#     return 301 https://\$server_name\$request_uri;
-# }
-
-# server {
-#     listen 443 ssl;
-#     server_name $domain;
-    
-#     ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;
-#     ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
-#     ssl_protocols TLSv1.2 TLSv1.3;
-#     ssl_ciphers ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384;
-#     ssl_prefer_server_ciphers off;
-    
-#     location / {
-#         proxy_pass http://127.0.0.1:$http_port;
-#         proxy_set_header Host \$host;
-#         proxy_set_header X-Real-IP \$remote_addr;
-#         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-#         proxy_set_header X-Forwarded-Proto \$scheme;
-#         proxy_buffering off;
-#     }
-    
-#     access_log /var/log/nginx/${domain}_access.log;
-#     error_log /var/log/nginx/${domain}_error.log;
-# }
-# EOF
-#     else
-#         sudo tee /etc/nginx/sites-available/$domain > /dev/null << EOF
-# server {
-#     listen 80;
-#     server_name $domain;
-    
-#     location / {
-#         proxy_pass http://127.0.0.1:$http_port;
-#         proxy_set_header Host \$host;
-#         proxy_set_header X-Real-IP \$remote_addr;
-#         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-#         proxy_set_header X-Forwarded-Proto \$scheme;
-#         proxy_buffering off;
-#     }
-    
-#     access_log /var/log/nginx/${domain}_access.log;
-#     error_log /var/log/nginx/${domain}_error.log;
-# }
-# EOF
-#     fi
-    
-    # Активируем сайт
-    sudo ln -sf /etc/nginx/sites-available/$domain /etc/nginx/sites-enabled/
-    
-    # Проверяем конфигурацию и перезапускаем nginx
-    if sudo nginx -t; then
-        sudo systemctl reload nginx
-        print_success "Nginx сконфигурирован для домена $domain"
-    else
-        print_error "Ошибка в конфигурации nginx"
-        exit 1
-    fi
-}
-
-# Функция для создания конфигурации nginx с SSL (для docker-compose)
-create_nginx_ssl_config() {
-    local domain="$1"
-    
-    print_info "Создание конфигурации Nginx в контейнере с SSL..."
-    
-    cat > nginx/default.conf << EOF
-server {
-    listen 80;
-    server_name $domain;
-    return 301 https://\$server_name\$request_uri;
-}
-
-server {
-    listen 443 ssl;
-    server_name $domain;
-    root /var/www/public;
-    index index.php index.html;
-
-    ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384;
-    ssl_prefer_server_ciphers off;
-
-    access_log /var/log/nginx/access.log;
-    error_log /var/log/nginx/error.log;
-
-    location / {
-        try_files \$uri \$uri/ /index.php?\\$query_string;
-    }
-
-    location ~ \.php\$ {
-        fastcgi_pass php:9000;
-        fastcgi_index index.php;
-        fastcgi_param SCRIPT_FILENAME \\$document_root\\$fastcgi_script_name;
-        include fastcgi_params;
-        fastcgi_buffering off;
-        fastcgi_read_timeout 300;
-    }
-
-    location ~ /\.ht {
-        deny all;
-    }
-}
-EOF
-}
-
-echo -e "${BLUE}🐳 Настройка Docker окружения: PHP 8.4 + Nginx + MySQL + Telegram Bot API${NC}"
+echo -e "${BLUE}🐳 Настройка Docker окружения: PHP 8.4 + Nginx + MySQL + Local Telegram Bot API Server${NC}"
 
 # Настройка Telegram уведомлений
 echo ""
@@ -462,33 +446,148 @@ fi
 # Настройка автозапуска
 echo ""
 print_info "Настройка автозапуска при перезагрузке сервера"
-read -p "Включить автозапуск при загрузке системы? (Y/n): " enable_autostart
+read -p "Включить автозапуск при загрузке системы? (Y/n , ENTER - нет): " enable_autostart
 enable_autostart=${enable_autostart:-y}
 
 # Настройка Telegram Bot API
 echo ""
-print_info "Настройка Telegram Bot API (aiogram)"
-read -p "Установить Telegram Bot API? (y/N): " install_telegram_api
-install_telegram_api=${install_telegram_api:-n}
-
-if [[ "$install_telegram_api" =~ ^[Yy]$ ]]; then
-    read -p "TELEGRAM_API_ID: " TELEGRAM_API_ID
+print_info "Настройка Local Telegram Bot API server(aiogram)"
+read -p "TELEGRAM_API_ID (нажмите Enter чтобы пропустить установку): " TELEGRAM_API_ID
+if [ -n "$TELEGRAM_API_ID" ]; then
     read -p "TELEGRAM_API_HASH: " TELEGRAM_API_HASH
-    
-    if [ -n "$TELEGRAM_API_ID" ] && [ -n "$TELEGRAM_API_HASH" ]; then
+        if [ -n "$TELEGRAM_API_HASH" ]; then
         print_success "Telegram Bot API будет установлен"
+        install_telegram_api="y"
         TELEGRAM_STAT_PORT="8082"
         TELEGRAM_HTTP_PORT="8081"
     else
-        print_error "API ID и HASH обязательны для установки Telegram Bot API"
+        print_error "API HASH обязателен для установки Telegram Bot API"
         install_telegram_api="n"
     fi
+else
+    print_info "Установка Telegram Bot API пропущена"
+    install_telegram_api="n"
 fi
 
 # Настройка GitHub
 echo ""
 print_info "Настройка доступа к GitHub"
 read -p "URL репозитория GitHub (Enter чтобы пропустить): " GITHUB_REPO
+
+# Запрос доменного имени и SSL
+read -p "Доменное имя (пусто = localhost): " domain_name
+domain_name=${domain_name:-localhost}
+
+read -p "Включить SSL? (y/N): " enable_ssl
+enable_ssl=${enable_ssl:-n}
+
+# Запрос порта для приложения
+read -p "Порт для HTTP приложения (пусто = 8080): " http_port
+http_port=${http_port:-8080}
+
+# Валидация порта
+print_info "Валидация порта"
+while ! [[ "$http_port" =~ ^[0-9]+$ ]] || [ "$http_port" -lt 1 ] || [ "$http_port" -gt 65535 ]; do
+    print_error "Некорректный порт: $http_port"
+    read -p "Введите порт (1-65535): " http_port
+done
+
+# Проверка что порт свободен
+print_info "Проверка что порт свободен"
+if ! check_port_available "$http_port"; then
+    print_warning "Порт $http_port уже занят"
+    read -p "Продолжить? (может привести к конфликту) (y/N): " continue_with_used_port
+    if [[ ! "$continue_with_used_port" =~ ^[Yy]$ ]]; then
+        print_error "Прервано пользователем"
+        exit 1
+    fi
+else
+    print_success "Порт $http_port свободен"
+fi
+
+# Запрос установки Xdebug
+read -p "Установить Xdebug? (y/N): " install_xdebug
+install_xdebug=${install_xdebug:-n}
+
+# Если Xdebug устанавливается, запрашиваем IP для отладки
+if [[ "$install_xdebug" =~ ^[Yy]$ ]]; then
+    install_xdebug="y" 
+    echo ""
+    print_info "Настройка Xdebug для удаленной отладки"
+    echo "   Для локальной разработки: 127.0.0.1 или localhost"
+    echo "   Для удаленной IDE: IP вашего компьютера"
+    echo "   Для отключения отладки: 0.0.0.0"
+    
+    read -p "   IP для отладки Xdebug (пусто = host.docker.internal): " xdebug_host
+    xdebug_host=${xdebug_host:-host.docker.internal}
+    
+    read -p "Порт Xdebug (пусто = 9003): " xdebug_port
+    xdebug_port=${xdebug_port:-9003}
+    
+    read -p "IDE Key (пусто = PHPSTORM): " xdebug_idekey
+    xdebug_idekey=${xdebug_idekey:-PHPSTORM}
+    
+    print_info "Xdebug будет подключаться к: $xdebug_host:$xdebug_port"
+else
+    install_xdebug="n"
+fi
+
+# Запрос о выставлении порта MySQL наружу
+read -p "Выставить порт MySQL наружу? (y/N): " expose_mysql
+expose_mysql=${expose_mysql:-n}
+
+# Запрос пароля MySQL
+read -p "Пароль для MySQL root пользователя (пусто = сгенерировать автоматически): " mysql_root_password
+if [ -z "$mysql_root_password" ]; then
+    mysql_root_password=$(generate_password 16)
+    print_success "Сгенерирован пароль MySQL root (сохранен в .env)"
+fi
+
+# Запрос названия базы данных
+read -p "Название базы данных (пусто = app_db): " mysql_database
+mysql_database=${mysql_database:-app_db}
+
+read -p "Имя пользователя MySQL (пусто = app_user): " mysql_user
+mysql_user=${mysql_user:-app_user}
+
+read -p "Пароль пользователя MySQL (пусто = сгенерировать автоматически): " mysql_password
+if [ -z "$mysql_password" ]; then
+    mysql_password=$(generate_password 16)
+    print_success "Сгенерирован пароль пользователя MySQL (сохранен в .env)"
+fi
+
+# Получаем IP VPS
+vps_ip=$(hostname -I | awk '{print $1}' 2>/dev/null || echo "неизвестно")
+
+# СОХРАНЯЕМ ВСЕ ПЕРЕМЕННЫЕ В .env СЕЙЧАС ЖЕ
+print_info "Сохранение конфигурации в .env..."
+save_env \
+    "PROJECT_ROOT" \
+    "TELEGRAM_BOT_TOKEN" \
+    "TELEGRAM_CHAT_ID" \
+    "enable_autostart" \
+    "install_telegram_api" \
+    "TELEGRAM_API_ID" \
+    "TELEGRAM_API_HASH" \
+    "TELEGRAM_STAT_PORT" \
+    "TELEGRAM_HTTP_PORT" \
+    "GITHUB_REPO" \
+    "domain_name" \
+    "enable_ssl" \
+    "http_port" \
+    "install_xdebug" \
+    "xdebug_host" \
+    "xdebug_port" \
+    "xdebug_idekey" \
+    "expose_mysql" \
+    "mysql_root_password" \
+    "mysql_database" \
+    "mysql_user" \
+    "mysql_password" \
+    "vps_ip"
+
+# Перезагружаем переменные из .env
+load_env
 
 if [ -n "$GITHUB_REPO" ]; then
     # Проверяем или создаем пользователя github
@@ -506,8 +605,10 @@ if [ -n "$GITHUB_REPO" ]; then
     
     # Теперь настраиваем права (ПОСЛЕ создания пользователя)
     print_info "Настройка прав доступа для пользователя github..."
-    sudo chown -R github:github wwwdata/ tdlib/ logs/
-    sudo chmod -R 755 wwwdata/ tdlib/ logs/
+    sudo chown -R github:github "$PROJECT_ROOT/wwwdata/" 
+    sudo chown -R github:github "$PROJECT_ROOT/tdlib/"
+    sudo chown -R github:github "$PROJECT_ROOT/logs/"
+    sudo chmod -R 755 "$PROJECT_ROOT/wwwdata/" "$PROJECT_ROOT/tdlib/" "$PROJECT_ROOT/logs/"
     print_success "Права доступа для пользователя github настроены"
     
     # Переключаемся на пользователя github
@@ -577,6 +678,12 @@ if [ -n "$GITHUB_REPO" ]; then
         fi
     fi
     
+    # Проверка успешности клонирования
+    if [ ! -d "$TEMP_CLONE_DIR" ] || [ -z "$(ls -A "$TEMP_CLONE_DIR" 2>/dev/null)" ]; then
+        print_error "Не удалось клонировать репозиторий или репозиторий пуст"
+        exit 1
+    fi
+    
     # Получаем список веток
     cd "$TEMP_CLONE_DIR"
     BRANCHES=$(git branch -r | grep -v HEAD | sed 's/origin\///' | tr -d ' ')
@@ -623,175 +730,144 @@ else
     mkdir -p wwwdata/public
 fi
 
-# Проверяем, установлен ли Docker
-if ! command -v docker &> /dev/null; then
-    print_error "Docker не установлен. Установите Docker сначала."
-    exit 1
-fi
 
-if ! command -v docker-compose &> /dev/null; then
-    print_error "Docker Compose не установлен. Установите Docker Compose сначала."
-    exit 1
-fi
 
-# Установка и настройка хостового nginx
-print_info "Установка и настройка Nginx на хостовой машине..."
-if ! command -v nginx &> /dev/null; then
-    sudo apt update
-    sudo apt install -y nginx
-    sudo systemctl enable nginx
-    sudo systemctl start nginx
-    print_success "Nginx установлен и запущен"
-else
-    print_success "Nginx уже установлен"
-fi
 
-# Функция для генерации случайного пароля
-generate_password() {
-    local length=${1:-16}
-    # Только буквы и цифры - 100% безопасно для YAML
-    tr -dc 'A-Za-z0-9' < /dev/urandom | head -c "$length"
+
+
+
+
+
+# Создаем конфигурацию nginx
+print_info "Создание конфигурации nginx..."
+
+cat > nginx/nginx.conf << 'EOF'
+user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log warn;
+pid /var/run/nginx.pid;
+
+events {
+    worker_connections 1024;
+    use epoll;
+    multi_accept on;
 }
 
-# Запрос конфигурации Docker
-echo ""
-print_info "Настройка Docker конфигурации"
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
 
-# Определяем домен/IP
-read -p "Доменное имя или IP VPS (пусто = localhost): " domain_name
-domain_name=${domain_name:-localhost}
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" "$http_x_forwarded_for"';
 
-# Настройка SSL
-echo ""
-read -p "Настроить SSL с Let's Encrypt? (y/N): " enable_ssl
-enable_ssl=${enable_ssl:-n}
+    access_log /var/log/nginx/access.log main;
 
-# Запрос порта для приложения
-read -p "Порт для HTTP приложения (пусто = 8080): " http_port
-http_port=${http_port:-8080}
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    types_hash_max_size 2048;
+    server_tokens off;
 
-# Проверка что порт свободен
-if ss -tulpn | grep -q ":${http_port}[[:space:]]"; then
-    print_warning "Порт $http_port уже занят"
-    read -p "Продолжить? (может привести к конфликту) (y/N): " continue_with_used_port
-    if [[ ! "$continue_with_used_port" =~ ^[Yy]$ ]]; then
-        print_error "Прервано пользователем"
-        exit 1
-    fi
-fi
+    # Gzip Settings
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml application/xml+rss text/javascript;
 
-# Запрос установки Xdebug
-read -p "Установить Xdebug? (y/N): " install_xdebug
-install_xdebug=${install_xdebug:-n}
+    # Включаем файлы конфигурации
+    include /etc/nginx/conf.d/*.conf;
+    include /etc/nginx/snippets/*.conf;
+}
+EOF
 
-# Если Xdebug устанавливается, запрашиваем IP для отладки
-if [[ "$install_xdebug" =~ ^[Yy]$ ]]; then
-    echo ""
-    print_info "Настройка Xdebug для удаленной отладки"
-    echo "   Для локальной разработки: 127.0.0.1 или localhost"
-    echo "   Для удаленной IDE: IP вашего компьютера"
-    echo "   Для отключения отладки: 0.0.0.0"
-    
-    read -p "IP для отладки Xdebug (пусто = host.docker.internal): " xdebug_host
-    xdebug_host=${xdebug_host:-host.docker.internal}
-    
-    read -p "Порт Xdebug (пусто = 9003): " xdebug_port
-    xdebug_port=${xdebug_port:-9003}
-    
-    read -p "IDE Key (пусто = PHPSTORM): " xdebug_idekey
-    xdebug_idekey=${xdebug_idekey:-PHPSTORM}
-    
-    print_info "Xdebug будет подключаться к: $xdebug_host:$xdebug_port"
-fi
+cat > nginx/conf.d/app.conf << 'EOF'
+server {
+    listen 80;
+    server_name _;
+    root /var/www/public;
+    index index.php index.html;
 
-# Запрос о выставлении порта MySQL наружу
-read -p "Выставить порт MySQL наружу? (y/N): " expose_mysql
-expose_mysql=${expose_mysql:-n}
+    access_log /var/log/nginx/app.access.log;
+    error_log /var/log/nginx/app.error.log;
 
-# Запрос пароля MySQL
-read -p "Пароль для MySQL root пользователя (пусто = сгенерировать автоматически): " mysql_root_password
-if [ -z "$mysql_root_password" ]; then
-    mysql_root_password=$(generate_password 16)
-    print_success "Сгенерирован пароль MySQL root: $mysql_root_password"
-fi
+    location / {
+        try_files $uri $uri/ /index.php?$query_string;
+    }
 
-# Запрос названия базы данных
-read -p "Название базы данных (пусто = app_db): " mysql_database
-mysql_database=${mysql_database:-app_db}
+    location ~ \.php$ {
+        fastcgi_pass php:9000;
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        include fastcgi_params;
+        
+        fastcgi_buffers 16 16k;
+        fastcgi_buffer_size 32k;
+        fastcgi_connect_timeout 300;
+        fastcgi_send_timeout 300;
+        fastcgi_read_timeout 300;
+    }
 
-read -p "Имя пользователя MySQL (пусто = app_user): " mysql_user
-mysql_user=${mysql_user:-app_user}
+    location ~ /\.ht {
+        deny all;
+    }
 
-read -p "Пароль пользователя MySQL (пусто = сгенерировать автоматически): " mysql_password
-if [ -z "$mysql_password" ]; then
-    mysql_password=$(generate_password 16)
-    print_success "Сгенерирован пароль пользователя MySQL: $mysql_password"
-fi
+    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        try_files $uri =404;
+    }
+}
+EOF
+
+print_success "Конфигурация nginx создана"
 
 # Создаем Dockerfile для PHP 8.4
 print_info "Создание Dockerfile для PHP..."
-echo "Текущая директория: $(pwd)"
+
 cat > php/Dockerfile << 'EOF'
 FROM php:8.4-fpm
 
-# Установка системных зависимостей
+# Системные зависимости
 RUN apt-get update && apt-get install -y \
-    git \
-    curl \
-    libpng-dev \
-    libonig-dev \
-    libxml2-dev \
-    zip \
-    unzip \
-    libzip-dev \
-    default-mysql-client
+    git curl libpng-dev libonig-dev libxml2-dev \
+    zip unzip libzip-dev default-mysql-client \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
-# Очистка кеша apt
-RUN apt-get clean && rm -rf /var/lib/apt/lists/*
-
-# Установка PHP расширений
+# PHP расширения
 RUN docker-php-ext-install \
-    pdo_mysql \
-    mbstring \
-    exif \
-    pcntl \
-    bcmath \
-    gd \
-    zip \
-    sockets
+    pdo_mysql mbstring exif pcntl bcmath gd zip sockets
 
-# Создание рабочей директории
+# Условная установка Xdebug
+ARG INSTALL_XDEBUG=false
+RUN if [ "$INSTALL_XDEBUG" = "true" ]; then \
+    pecl install xdebug && \
+    docker-php-ext-enable xdebug && \
+    echo "xdebug.mode=debug" >> /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini && \
+    echo "xdebug.client_host=host.docker.internal" >> /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini && \
+    echo "xdebug.client_port=9003" >> /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini; \
+    echo " .... ....  Xdebug YCTAHOBLEH и активирован .... ....  "; \
+else \
+    echo " .... ....  Xdebug HE устанавливается .... ....  "; \
+    fi
+
 WORKDIR /var/www
-
-# Настройка прав
-RUN chown -R www-data:www-data /var/www
-RUN usermod -u 1000 www-data
-
-EXPOSE 9000
+RUN chown -R www-data:www-data /var/www && \
+    usermod -u 1000 www-data
 
 CMD ["php-fpm"]
 EOF
 
-# Добавляем Xdebug если нужно
+# Добавляем Xdebug конфигурацию если нужно
 if [[ "$install_xdebug" =~ ^[Yy]$ ]]; then
     print_info "Добавление Xdebug в Dockerfile..."
-    cat >> php/Dockerfile << 'EOF'
-
-# Установка Xdebug
-RUN pecl install xdebug && \
-    docker-php-ext-enable xdebug
-
-# Копирование конфигурации Xdebug
-COPY xdebug.ini /usr/local/etc/php/conf.d/xdebug.ini
-EOF
-
-    # Создаем конфигурацию Xdebug с автозапуском при каждом запросе
-    print_info "Создание конфигурации Xdebug..."
     cat > php/xdebug.ini << EOF
 zend_extension=xdebug
 
 ; Основные настройки - АКТИВАЦИЯ ПРИ КАЖДОМ ЗАПРОСЕ
-xdebug.mode=develop,debug
+xdebug.mode=develop, profile, trace, coverage, gcstats, debug 
 xdebug.start_with_request=yes
 xdebug.discover_client_host=0
 
@@ -802,7 +878,7 @@ xdebug.idekey=$xdebug_idekey
 
 ; Настройки для отладки
 xdebug.log=/var/log/xdebug.log
-xdebug.log_level=7
+xdebug.log_level=12
 
 ; Оптимизация производительности
 xdebug.max_nesting_level=512
@@ -811,13 +887,20 @@ xdebug.var_display_max_data=512
 xdebug.var_display_max_depth=5
 EOF
 
+    # Добавляем копирование xdebug.ini в Dockerfile
+    cat >> php/Dockerfile << EOF
+
+# Копирование конфигурации Xdebug
+COPY xdebug.ini /usr/local/etc/php/conf.d/xdebug.ini
+EOF
+
     print_success "Xdebug настроен для автозапуска при каждом запросе"
 else
     rm -f php/xdebug.ini
     print_info "Xdebug не будет установлен"
 fi
 
-# Создаем docker-compose.yml
+# Создаем docker-compose.yml с подгрузкой переменных из .env
 print_info "Создание docker-compose.yml..."
 
 # Настройка портов MySQL
@@ -830,19 +913,18 @@ else
     print_info "Порт MySQL будет закрыт (доступ только внутри Docker сети)"
 fi
 
-# Базовый docker-compose.yml
-cat > docker-compose.yml << EOF
-version: '3.8'
-
+# Базовый docker-compose.yml с переменными окружения
+cat > docker-compose.yml << 'EOF'
 services:
   nginx:
     image: nginx:alpine
     container_name: php_nginx
     ports:
-      - "$http_port:80"
+      - "${http_port}:80"
     volumes:
       - ./wwwdata:/var/www
-      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d/:/etc/nginx/conf.d/:ro
       - ./logs/nginx:/var/log/nginx
 EOF
 
@@ -853,17 +935,26 @@ if [[ "$enable_ssl" =~ ^[Yy]$ ]]; then
 EOF
 fi
 
-cat >> docker-compose.yml << EOF
+cat >> docker-compose.yml << 'EOF'
     depends_on:
       - php
     networks:
       - app-network
+    env_file:
+      - .env
 
   php:
-    build: ./php
+    build: 
+      context: ./php
+      args:
+        - PROJECT_ROOT=${PROJECT_ROOT}
+        - INSTALL_XDEBUG=${install_xdebug}
     container_name: php_app
+    networks:
+      - app-network
     volumes:
       - ./wwwdata:/var/www
+      - ./logs/php:/var/log/
       - ./tdlib:/var/www/.tdlib
 EOF
 
@@ -879,16 +970,16 @@ fi
 
 # Добавляем Telegram Bot API если нужно
 if [[ "$install_telegram_api" =~ ^[Yy]$ ]]; then
-    cat >> docker-compose.yml << EOF
+    cat >> docker-compose.yml << 'EOF'
 
   telegram-api:
     image: aiogram/telegram-bot-api:latest
     container_name: telegram_bot_api
     environment:
-      - TELEGRAM_API_ID=$TELEGRAM_API_ID
-      - TELEGRAM_API_HASH=$TELEGRAM_API_HASH
-      - TELEGRAM_STAT_PORT=$TELEGRAM_STAT_PORT
-      - TELEGRAM_HTTP_PORT=$TELEGRAM_HTTP_PORT
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+      - TELEGRAM_STAT_PORT=${TELEGRAM_STAT_PORT}
+      - TELEGRAM_HTTP_PORT=${TELEGRAM_HTTP_PORT}
       - TELEGRAM_VERBOSITY=9
       - TELEGRAM_LOG=./tdlib-log.txt
     volumes:
@@ -896,29 +987,30 @@ if [[ "$install_telegram_api" =~ ^[Yy]$ ]]; then
     networks:
       - app-network
     restart: unless-stopped
+    env_file:
+      - .env
 EOF
 fi
 
 cat >> docker-compose.yml << EOF
-    networks:
-      - app-network
-
+    
   mysql:
     image: mysql:8.0
     container_name: php_mysql
     command: --default-authentication-plugin=mysql_native_password
     environment:
-      MYSQL_ROOT_PASSWORD: $mysql_root_password
-      MYSQL_DATABASE: $mysql_database
-      MYSQL_USER: $mysql_user
-      MYSQL_PASSWORD: $mysql_password
-    ports:
+      MYSQL_ROOT_PASSWORD: \${mysql_root_password}
+      MYSQL_DATABASE: \${mysql_database}
+      MYSQL_USER: \${mysql_user}
+      MYSQL_PASSWORD: \${mysql_password}
 $mysql_ports
     volumes:
       - mysql_data:/var/lib/mysql
-      - ./mysql/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./mysql/:/docker-entrypoint-initdb.d/
     networks:
       - app-network
+    env_file:
+      - .env
 
 volumes:
   mysql_data:
@@ -1013,14 +1105,34 @@ chmod -R 755 logs
 
 print_info "Сборка и запуск контейнеров..."
 docker-compose down 2>/dev/null || true
-docker-compose build --no-cache
+
+# Умная сборка с кешированием
+if [ ! -f ".built" ] || [ php/Dockerfile -nt .built ]; then
+    docker-compose build
+    touch .built
+else
+    print_success "Используется кеш сборки"
+fi
+
 docker-compose up -d
 
 print_info "Ожидание запуска сервисов..."
-sleep 30
+sleep 10
 
-# Настраиваем хостовой nginx и SSL
-setup_ssl "$domain_name" "$enable_ssl"
+# Проверка здоровья сервисов
+print_info "Проверка здоровья сервисов..."
+if ! docker-compose ps | grep -q "Up"; then
+    print_error "Не все контейнеры запустились"
+    docker-compose logs
+    exit 1
+fi
+
+# Проверка доступности nginx
+if curl -s -f "http://localhost:$http_port" > /dev/null; then
+    print_success "Nginx отвечает на порту $http_port"
+else
+    print_warning "Nginx пока не отвечает (возможно еще запускается)"
+fi
 
 # Настраиваем автозапуск
 setup_autostart "$enable_autostart"
@@ -1029,32 +1141,14 @@ setup_autostart "$enable_autostart"
 print_info "Проверка статуса контейнеров..."
 docker-compose ps
 
-# Получаем IP VPS
-vps_ip=$(hostname -I | awk '{print $1}' 2>/dev/null || echo "неизвестно")
-
-# Сохраняем конфигурацию
-cat > .env << EOF
-# Docker Environment Configuration
-DOMAIN=$domain_name
-HTTP_PORT=$http_port
-MYSQL_ROOT_PASSWORD=$mysql_root_password
-MYSQL_DATABASE=$mysql_database
-MYSQL_USER=$mysql_user
-MYSQL_PASSWORD=$mysql_password
+# Обновляем .env с дополнительными переменными
+cat >> .env << EOF
+AUTOSTART_ENABLED=$([ "$enable_autostart" = [yY] ] && echo "true" || echo "false")
+SSL_ENABLED=$([ "$enable_ssl" = [yY] ] && echo "true" || echo "false")
+SSL_DOMAIN=$domain_name
 XDEBUG_ENABLED=$install_xdebug
-XDEBUG_HOST=$xdebug_host
-XDEBUG_PORT=$xdebug_port
-XDEBUG_IDEKEY=$xdebug_idekey
 MYSQL_EXPOSED=$expose_mysql
-VPS_IP=$vps_ip
-TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN
-TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID
-GITHUB_REPO=$GITHUB_REPO
 TELEGRAM_API_ENABLED=$install_telegram_api
-TELEGRAM_API_ID=$TELEGRAM_API_ID
-TELEGRAM_API_HASH=$TELEGRAM_API_HASH
-TELEGRAM_STAT_PORT=$TELEGRAM_STAT_PORT
-TELEGRAM_HTTP_PORT=$TELEGRAM_HTTP_PORT
 EOF
 
 # Формируем отчет
@@ -1065,39 +1159,47 @@ cat > "$REPORT_FILE" << EOF
 📊 КОНФИГУРАЦИЯ:
 🌐 Доменное имя: $domain_name
 🔗 HTTP порт приложения: $http_port
-🔐 SSL: $([ "$enable_ssl" = "y" ] && echo "включен (Let's Encrypt)" || echo "отключен")
+🔐 SSL: $([ "$enable_ssl" = [yY] ] && echo "включен (Let's Encrypt)" || echo "отключен")
 
 🗃️ MYSQL:
    База данных: $mysql_database
    Пользователь: $mysql_user
    Пароль пользователя: $mysql_password
    Root пароль: $mysql_root_password
-   Порт: $([ "$expose_mysql" = "y" ] && echo "открыт (3306)" || echo "закрыт")
+   Порт: $([ "$expose_mysql" = [yY] ] && echo "открыт (3306)" || echo "закрыт")
 
-🐛 XDEBUG: $([ "$install_xdebug" = "y" ] && echo "активен ($xdebug_host:$xdebug_port)" || echo "не активен")
+🐛 XDEBUG: $([[ $install_xdebug = [yY] ]] && echo "активен ($xdebug_host:$xdebug_port)" || echo "не активен")
 
-🤖 TELEGRAM BOT API: $([ "$install_telegram_api" = "y" ] && echo "активен" || echo "не активен")
-   $([ "$install_telegram_api" = "y" ] && echo "   Stat порт: $TELEGRAM_STAT_PORT (внутренний)" || "")
-   $([ "$install_telegram_api" = "y" ] && echo "   HTTP порт: $TELEGRAM_HTTP_PORT (внутренний)" || "")
-   $([ "$install_telegram_api" = "y" ] && echo "   Файлы TDLib: ./tdlib/" || "")
+🤖 TELEGRAM BOT API: $([[ $install_telegram_api = [yY] ]] && echo "УСТАНОВЛЕН" || echo "НЕ установлен")
+   $([[ $install_telegram_api = [yY] ]]  && echo "   Stat порт: $TELEGRAM_STAT_PORT (внутренний)" || "")
+   $([[ $install_telegram_api = [yY] ]]  && echo "   HTTP порт: $TELEGRAM_HTTP_PORT (внутренний)" || "")
+   $([ "$install_telegram_api" = [yY] ] && echo "   Файлы TDLib: ./tdlib/" || "")
 
 📥 GITHUB: $([ -n "$GITHUB_REPO" ] && echo "клонирован ($GITHUB_REPO)" || echo "не использовался")
 
-🔧 АВТОЗАПУСК: $([ "$enable_autostart" = "y" ] && echo "включен ✅" || echo "отключен ❌")
+🔧 АВТОЗАПУСК: $([ "$enable_autostart" = [yY] ] && echo "включен ✅" || echo "отключен ❌")
 
 🔗 ДОСТУП:
    HTTP: http://$domain_name
-   $([ "$enable_ssl" = "y" ] && echo "HTTPS: https://$domain_name" || "")
-   $([ "$install_telegram_api" = "y" ] && echo "   Telegram API Example: http://$domain_name/telegram_example.php" || "")
+   $([ "$enable_ssl" = [yY] ] && echo "HTTPS: https://$domain_name" || "")
+   $([ "$install_telegram_api" = [yY] ] && echo "   Telegram API Example: http://$domain_name/telegram_example.php" || "")
 
 ⚙️ УПРАВЛЕНИЕ:
-   Запуск: ./manage.sh start
-   Остановка: ./manage.sh stop
-   Логи: ./manage.sh logs
-   Статус: ./manage.sh status
-   Автозапуск: ./manage.sh autostart [enable|disable|status]
-   SSL: ./manage.sh ssl [renew|status]
-   Telegram API: ./manage.sh telegram [stats|logs|restart]
+   Запуск: docker-compose up -d
+   Остановка: docker-compose down
+   Логи: docker-compose logs -f
+   Статус: docker-compose ps
+   Пересборка: docker-compose build --no-cache
+
+📁 ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ:
+   Все настройки сохранены в файле .env
+   Для изменения конфигурации отредактируйте .env и перезапустите контейнеры
+
+🔍 ДИАГНОСТИКА:
+   Логи nginx: docker-compose logs nginx
+   Логи php: docker-compose logs php
+   Логи mysql: docker-compose logs mysql
+   Логи telegram: docker-compose logs telegram-api
 EOF
 
 # Выводим отчет
@@ -1115,3 +1217,6 @@ fi
 rm -f "$REPORT_FILE"
 
 print_success "Настройка завершена!"
+echo ""
+print_info "Для управления используйте: docker-compose [up|down|logs|ps]"
+print_info "Файл конфигурации: .env"
