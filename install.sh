@@ -405,6 +405,8 @@ send_telegram_file() {
     fi
 }
 
+
+
 # Создаем необходимые директории
 echo ""
 
@@ -415,7 +417,7 @@ CURRENT_DIR=$(pwd)
 print_info "Текущая директория: $CURRENT_DIR"
 
 # Создаем директории по одной с проверкой
-for dir in php tdlib wwwdata logs logs/tdlib mysql; do
+for dir in php tdlib wwwdata logs logs/tdlib mysql nginx nginx/conf.d; do
     if mkdir -p "$dir"; then
         print_success "Создана директория: $dir"
     else
